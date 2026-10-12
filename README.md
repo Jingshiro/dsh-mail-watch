@@ -110,6 +110,8 @@ python py\mail_watch.py --once                      # 手动查一次（插件�
                 "permissionPreset": "workspace-write", "notifyPhrase": "邮箱有新邮件了，去看一下" },
   "watch":    { "intervalSeconds": 45, "quietHours": "00:00-08:00",
                 "includeSelfTests": false, "maxItemsPerSession": 10, "restartDelayMs": 5000 }
+  // includeSelfTests: false 时，只有「带 loop 头 且 发件人是本机账号」的自测回环信会被滤掉；
+  // 其他机器同款插件发来的对聊信（也带 loop 头）会正常投递开新会话。
 }
 ```
 
@@ -136,6 +138,10 @@ python py\mail_watch.py --once                      # 手动查一次（插件�
 6. **`ctx.effect` 是唯一清理入口**：子进程、路由、规则全挂上面，否则热重载留野进程。
 7. **热重载边界**：`patchReload: live` 下改 patch 里生效的 config 值会热重载；但改本插件的
    `lib/index.js` 不重替换（ESM 按 URL 缓存），要真重启 DSH。浏览器半边 `lib/client.js` 刷新页面即可。
+8. **loop 头 ≠ 自己的信（0.2.1 修的真实事故）**：`X-Mailwatch-Loop` 是「本插件家族发出的信」的
+   标记，**不是「本机账号发出」**——另一台机器跑着同款插件给这台发对聊信时也带这个头。只认头
+   会把对方的来信当成回环自测信静默吞掉。判定必须双条件：带 loop 头 **且** 发件人 == `imap.user`。
+   两台同款插件互发邮件对聊是支持的玩法，别把自家标记当过滤器判据。
 
 ## 从早期版本升级
 

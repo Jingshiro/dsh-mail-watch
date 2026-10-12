@@ -130,7 +130,7 @@ class Watcher:
             return False
         items = []
         for uid in pending[:MAX_ITEMS_PER_TICK]:
-            h = M.fetch_header_fields(mail, uid)
+            h = M.fetch_header_fields(mail, uid, own_user=self.cfg["imap"]["user"])
             if h is not None:
                 items.append(h)
         new_last = max([i["uid"] for i in items] or pending)

@@ -122,11 +122,25 @@ def imap_connect(cfg):
     return m
 
 
-def is_self_mail(msg):
-    for header in LOOP_HEADERS:
-        if str(msg.get(header) or "").strip() == "1":
-            return True
-    return False
+def is_self_mail(msg, own_user=None):
+    """自测/回环信判定。
+
+    v2.1 修正：loop 头在 ≠ 自己的信。X-Mailwatch-Loop 是「同款插件发出」的标记，
+    但别的机器跑着同一个插件给咱们发对接信时，头里也带着它——那不是回环，是正经来信，
+    静默滤掉它就是漏信（2026-10-11 candyliujx 初次见面那封就是这么被吞的）。
+
+    所以 self 必须同时满足：带 loop 头 AND 发件人 == 本机账号。
+    own_user 给不出时退回旧行为（只认头），仅当兜底。
+    """
+    if str(msg.get("X-Mailwatch-Loop") or "").strip() != "1":
+        return False
+    if own_user:
+        try:
+            from_addr = parseaddr(str(msg.get("From") or ""))[1].lower()
+        except Exception:
+            from_addr = ""
+        return from_addr == str(own_user).strip().lower()
+    return True
 
 
 def read_message(mail, selector):
@@ -175,14 +189,14 @@ def find_text(msg):
     return None
 
 
-def header_summary(msg, uid=None):
+def header_summary(msg, uid=None, own_user=None):
     return {
         "uid": uid,
         "from": str(msg.get("From") or "").strip(),
         "to": str(msg.get("To") or "").strip(),
         "subject": str(msg.get("Subject") or "").strip(),
         "date": str(msg.get("Date") or "").strip(),
-        "self": is_self_mail(msg),
+        "self": is_self_mail(msg, own_user),
     }
 
 
@@ -191,7 +205,7 @@ def uid_search(mail, criteria="ALL"):
     return sorted([int(t) for t in data[0].split() if t.isdigit()], reverse=True)
 
 
-def fetch_header_fields(mail, uid):
+def fetch_header_fields(mail, uid, own_user=None):
     typ, data = mail.uid(
         "FETCH", str(uid),
         "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE X-Mailwatch-Loop)])")
@@ -207,7 +221,7 @@ def fetch_header_fields(mail, uid):
         "from": str(msg.get("From") or "").strip()[:200],
         "subject": str(msg.get("Subject") or "").strip()[:200],
         "date": str(msg.get("Date") or "").strip()[:80],
-        "self": is_self_mail(msg),
+        "self": is_self_mail(msg, own_user),
     }
 
 
@@ -231,7 +245,7 @@ def cmd_check(cfg, cfg_path, show_all=False, as_json=False, limit=None):
             cap = limit or (30 if show_all else 15)
             items = []
             for uid in uids[:cap]:
-                h = fetch_header_fields(mail, uid)
+                h = fetch_header_fields(mail, uid, own_user=cfg["imap"]["user"])
                 if h is not None:
                     items.append(h)
         finally:
@@ -271,7 +285,8 @@ def cmd_read(cfg, cfg_path, selector, as_json=False):
         n = int(str(selector).strip())
     except ValueError:
         n = None
-    item = header_summary(msg, uid=n if n is not None and n >= 1000000 else None)
+    item = header_summary(msg, uid=n if n is not None and n >= 1000000 else None,
+                          own_user=cfg["imap"]["user"])
     item["body"] = find_text(msg)
     if as_json:
         print(json.dumps({"ok": True, "item": item}, ensure_ascii=False))
@@ -426,7 +441,7 @@ def cmd_selftest(cfg, cfg_path, as_json=False):
         uids = uid_search(mail)
         head = uids[:50]
         for uid in head:
-            h = fetch_header_fields(mail, uid)
+            h = fetch_header_fields(mail, uid, own_user=cfg["imap"]["user"])
             if h is None:
                 continue
             if stamp in (h["subject"] or ""):
