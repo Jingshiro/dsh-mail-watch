@@ -69,19 +69,24 @@ def main():
         refused = MA.smtp_send(cfg, msg, user, [to])
         if refused:
             rec["error"] = "refused: %s" % refused
-            MA.append_outbox(cfg_path, rec)
+            rec["outbox"] = MA.append_outbox(cfg_path, rec, cfg)
             print("REFUSED: %s" % refused)
+            MA._report_ledger(rec["outbox"])
             return 1
         rec["ok"] = True
-        MA.append_outbox(cfg_path, rec)
+        rec["outbox"] = MA.append_outbox(cfg_path, rec, cfg)
         print("OK: sent to %s | subject=%r | files=%s" % (to, subject, rec["files"]))
+        MA._report_ledger(rec["outbox"])
         return 0
     except Exception as e:
         rec["error"] = "%s: %s" % (type(e).__name__, e)
-        MA.append_outbox(cfg_path, rec)
+        rec["outbox"] = MA.append_outbox(cfg_path, rec, cfg)
         print("ERROR: %s" % rec["error"])
+        MA._report_ledger(rec["outbox"])
         return 1
 
 
 if __name__ == "__main__":
-    main()
+    # 必须把返回码交出去：旧版直接 `main()`，发信失败也 exit 0，
+    # 调用方（会话里的 agent）据此以为成功了——和 outbox 那事同一个病根。
+    sys.exit(main())

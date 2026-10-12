@@ -7,6 +7,8 @@
   python mail_agent.py read <seq_or_uid> [--json]           # 读一封信的头部+正文
   python mail_agent.py send <to> <subject> [--body-file F] [--no-sig] [--json]
   python mail_agent.py selftest                              # 发一封闭环自测信(带 loop 头,守夜进程认得并拦截)
+  python mail_agent.py sent [--json] [--limit N] [--folder F]  # 列信箱「已发送」(权威源)
+  python mail_agent.py sent <seq_or_uid> [--json]              # 读「已发送」里某一封的正文
 
 配置: `$MAILWATCH_HOME/config.json`，默认 `~/.dsh-mail-watch/config.json`，也可 `--config <路径>`。
 格式(JSON):
@@ -19,8 +21,17 @@
 
 所有出站信(成功与失败)都会 append 到所在目录的 `outbox.jsonl`，一行一条 JSON ——
 给邮件面板当「已发送」账本，也方便人工验收。
+
+**沙盒注意**：邮件会话跑在 `workspace-write` 沙盒里，可写范围只有会话工作区，
+写不了 `~/.dsh-mail-watch/outbox.jsonl`（实测 `[Errno 13] Permission denied`）。
+所以主账本写不进去时，记录会补录到 `<工作区>/.dsh/mail-watch/outbox-spool.jsonl`，
+由插件宿主（不受沙盒限制）并回主账本。两处都写不进去会**大声报错**，绝不静默吞掉。
+
+「已发送」的权威源是**信箱自己的 Sent 文件夹**（`sent` 子命令直连 IMAP 读它）：
+本地账本只覆盖「本机用本脚本发出去的信」，Sent 文件夹才是「真的出去了」的账。
 """
 import os
+import re
 import sys
 import json
 import time
@@ -58,6 +69,32 @@ def outbox_path(cfg_path):
     return os.path.join(home_for(cfg_path), "outbox.jsonl")
 
 
+# 沙盒内的会话只能写自己的工作区，写不了 dataDir；主账本落不进去时的补录落点。
+SPOOL_RELATIVE = os.path.join(".dsh", "mail-watch", "outbox-spool.jsonl")
+
+
+def spool_path(cfg):
+    """出站账本的补录路径 = `<delivery.workspacePath>/.dsh/mail-watch/outbox-spool.jsonl`。
+
+    只认配置里那个工作区（邮件会话就是开在它下面的，沙盒只放行它）；没配就返回 None。
+    """
+    ws = ((cfg or {}).get("delivery") or {}).get("workspacePath")
+    if not ws:
+        return None
+    ws = os.path.abspath(str(ws))
+    if not os.path.isdir(ws):
+        return None
+    return os.path.join(ws, SPOOL_RELATIVE)
+
+
+def _append_line(path, rec):
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def load_config(path=None):
     path = path or os.path.join(default_home(), "config.json")
     with open(path, "r", encoding="utf-8") as f:
@@ -83,18 +120,56 @@ def load_config(path=None):
     return cfg, path
 
 
-def append_outbox(cfg_path, rec):
-    """出站账本：成功与失败都落一行，一行一条 JSON。"""
+def append_outbox(cfg_path, rec, cfg=None):
+    """出站账本：成功与失败都落一行，一行一条 JSON。
+
+    返回**实际落点**，调用方必须如实上报，不许把「发送调用成功」当成「落账成功」：
+      "ledger" — 写进 dataDir 主账本（宿主/面板直接读的那本）
+      "spool"  — 主账本被沙盒拦住，补录到会话工作区，等宿主并回
+      None     — 两处都写不进去（已在 stderr 喊出来，调用方也要说出来）
+
+    2026-10-12 修的真实事故：邮件会话跑在 workspace-write 沙盒里，写 dataDir 会
+    `[Errno 13] Permission denied`；旧版重试 3 次后**只往 stderr 写一行就返回**，
+    于是信真发出去了、面板「已发送」却永远空着，会话里的 agent 还照着「已落账」
+    往下记账。三条一起修：补录 spool、失败必须大声、结果必须能读回。
+    """
     rec = dict(rec)
     rec.setdefault("at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    primary = outbox_path(cfg_path)
+    last_err = None
     for attempt in range(3):
         try:
-            with open(outbox_path(cfg_path), "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            return
+            _append_line(primary, rec)
+            return "ledger"
         except Exception as e:
-            sys.stderr.write("[outbox] append failed (attempt %s): %s\n" % (attempt + 1, e))
+            last_err = e
             time.sleep(0.2)
+    spool = spool_path(cfg)
+    if spool:
+        for attempt in range(2):
+            try:
+                _append_line(spool, rec)
+                sys.stderr.write(
+                    "[outbox] 主账本写不进去（%s）；已补录到工作区 spool，宿主会并回：%s\n"
+                    % (last_err, spool))
+                return "spool"
+            except Exception as e:
+                last_err = e
+                time.sleep(0.2)
+    sys.stderr.write("[outbox] append failed: %s\n" % (last_err,))
+    return None
+
+
+# 落点 → 给人看的一句话（"ledger" 正常，不用提醒）
+LEDGER_NOTES = {
+    "spool": "本地账本写不进去（沙盒只允许写会话工作区），已补录到工作区 spool，"
+             "插件下次读账本时会并回主账本。",
+    None: "本地账本两处都写不进去——这封信发出去了但没落账，请人工记一笔。",
+}
+
+
+def ledger_note(where):
+    return LEDGER_NOTES.get(where)
 
 
 def netease_style_id_hack(m):
@@ -222,6 +297,67 @@ def fetch_header_fields(mail, uid, own_user=None):
         "subject": str(msg.get("Subject") or "").strip()[:200],
         "date": str(msg.get("Date") or "").strip()[:80],
         "self": is_self_mail(msg, own_user),
+    }
+
+
+# ──────────────────────────── 「已发送」文件夹 ────────────────────────────
+# 权威的「我发出去的信」在信箱自己的 Sent 文件夹里（SMTP 发信时服务商替你存的）。
+# 名字各服务商不同，而且国内多是 modified UTF-7（163 的「已发送」= &XfJT0ZAB-），
+# 所以**不许靠猜名字**：先认 LIST 回来的 \Sent 特殊属性，再退回几个 ASCII 兜底名。
+SENT_FOLDER_FALLBACKS = ("&XfJT0ZAB-", "Sent", "Sent Items", "Sent Messages")
+
+
+def list_folders(mail):
+    """LIST 出 [(name, flags)]。name 原样（modified UTF-7 是 ASCII，直接可用）。"""
+    out = []
+    try:
+        typ, data = mail.list()
+    except Exception:
+        return out
+    for raw in data or []:
+        if not raw:
+            continue
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        m = re.match(r'^\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name>.+)$', line.strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+        out.append((name, m.group("flags")))
+    return out
+
+
+def find_sent_folder(mail, override=None, folders=None):
+    """挑出「已发送」文件夹名。override 优先（--folder），其次 \\Sent 属性，最后兜底名。"""
+    if override:
+        return override
+    pairs = folders if folders is not None else list_folders(mail)
+    for name, flags in pairs:
+        if "\\Sent" in flags:
+            return name
+    for name, _flags in pairs:
+        if name in SENT_FOLDER_FALLBACKS:
+            return name
+    return SENT_FOLDER_FALLBACKS[0]
+
+
+def fetch_sent_header(mail, uid):
+    """「已发送」里一封信的头部（收件人在这边才有意义）。"""
+    typ, data = mail.uid("FETCH", str(uid), "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
+    raw = None
+    for part in data:
+        if isinstance(part, tuple):
+            raw = part[1]
+    if raw is None:
+        return None
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    return {
+        "uid": uid,
+        "from": str(msg.get("From") or "").strip()[:200],
+        "to": str(msg.get("To") or "").strip()[:200],
+        "subject": str(msg.get("Subject") or "").strip()[:200],
+        "date": str(msg.get("Date") or "").strip()[:80],
     }
 
 
@@ -375,27 +511,43 @@ def cmd_send(cfg, cfg_path, to, subject, body, append_sig=True, as_json=False):
         refused = smtp_send(cfg, msg, user, [to])
         if refused:
             rec["error"] = "refused: %s" % refused
-            append_outbox(cfg_path, rec)
+            where = append_outbox(cfg_path, rec, cfg)
+            rec["outbox"] = where
             if as_json:
-                print(json.dumps({"ok": False, "error": rec["error"]}, ensure_ascii=False))
+                print(json.dumps({"ok": False, "error": rec["error"], "outbox": where},
+                                 ensure_ascii=False))
             else:
                 print("REFUSED: %s" % refused)
+                _report_ledger(where)
             return 1
         rec["ok"] = True
-        append_outbox(cfg_path, rec)
+        where = append_outbox(cfg_path, rec, cfg)
+        rec["outbox"] = where
         if as_json:
-            print(json.dumps({"ok": True}, ensure_ascii=False))
+            print(json.dumps({"ok": True, "outbox": where}, ensure_ascii=False))
         else:
             print("OK: sent to %s, subject=%r" % (to, subject))
+            _report_ledger(where)
         return 0
     except Exception as e:
         rec["error"] = "%s: %s" % (type(e).__name__, e)
-        append_outbox(cfg_path, rec)
+        where = append_outbox(cfg_path, rec, cfg)
+        rec["outbox"] = where
         if as_json:
-            print(json.dumps({"ok": False, "error": rec["error"]}, ensure_ascii=False))
+            print(json.dumps({"ok": False, "error": rec["error"], "outbox": where},
+                             ensure_ascii=False))
         else:
             print("ERROR: %s" % rec["error"], file=sys.stderr)
+            _report_ledger(where)
         return 1
+
+
+def _report_ledger(where):
+    """账本没落进主账本时，在**标准输出**上留一句——会话里的 agent 只看得到 stdout，
+    看不到 stderr 里那几行，这正是「信发出去了、账却没落」被当成成功的原因。"""
+    note = ledger_note(where)
+    if note:
+        print("[outbox] " + note)
 
 
 def cmd_selftest(cfg, cfg_path, as_json=False):
@@ -412,21 +564,29 @@ def cmd_selftest(cfg, cfg_path, as_json=False):
         refused = smtp_send(cfg, msg, from_user, [user])
         if refused:
             rec["error"] = "refused: %s" % refused
-            append_outbox(cfg_path, rec)
+            where = append_outbox(cfg_path, rec, cfg)
             if as_json:
-                print(json.dumps({"ok": False, "error": rec["error"]}, ensure_ascii=False))
+                print(json.dumps({"ok": False, "error": rec["error"], "outbox": where},
+                                 ensure_ascii=False))
             else:
                 print("REFUSED: %s" % refused)
+                _report_ledger(where)
             return 1
         rec["ok"] = True
-        append_outbox(cfg_path, rec)
+        where = append_outbox(cfg_path, rec, cfg)
+        if as_json:
+            print(json.dumps({"ok": True, "outbox": where}, ensure_ascii=False))
+        else:
+            _report_ledger(where)
     except Exception as e:
         rec["error"] = "%s: %s" % (type(e).__name__, e)
-        append_outbox(cfg_path, rec)
+        where = append_outbox(cfg_path, rec, cfg)
         if as_json:
-            print(json.dumps({"ok": False, "error": rec["error"]}, ensure_ascii=False))
+            print(json.dumps({"ok": False, "error": rec["error"], "outbox": where},
+                             ensure_ascii=False))
         else:
             print("ERROR: %s" % rec["error"])
+            _report_ledger(where)
         return 1
 
     sys.stdout.write("OK: selftest sent; waiting 8s for delivery...\n")
@@ -464,6 +624,67 @@ def cmd_selftest(cfg, cfg_path, as_json=False):
             pass
 
 
+def cmd_sent(cfg, cfg_path, selector=None, as_json=False, limit=None, folder=None):
+    """「已发送」的权威源：直连信箱 Sent 文件夹。
+
+    为什么不让面板只看本地 outbox.jsonl：账本是**发送方**写的，而发送方跑在
+    workspace-write 沙盒里——沙盒一拦，信出去了账却是空的（2026-10-12 的事故）。
+    Sent 文件夹在服务商那边，谁发的、有没有附件、历史上所有信都在里面。
+    selector 给了就读那一封的正文，否则列最近 N 封头部。全程 readonly。
+    """
+    try:
+        mail = imap_connect(cfg)
+    except Exception as e:
+        return fail("%s: %s" % (type(e).__name__, e), as_json)
+    fol = folder or SENT_FOLDER_FALLBACKS[0]
+    try:
+        fol = find_sent_folder(mail, folder)
+        typ, _data = mail.select(fol, readonly=True)
+        if typ != "OK":
+            return fail("打不开已发送文件夹 %r（用 --folder 指定？）" % fol, as_json)
+        if selector:
+            msg = read_message(mail, selector)
+            try:
+                n = int(str(selector).strip())
+            except ValueError:
+                n = None
+            item = header_summary(msg, uid=n if n is not None and n >= 1000000 else None)
+            item["body"] = find_text(msg)
+            if as_json:
+                print(json.dumps({"ok": True, "folder": fol, "item": item}, ensure_ascii=False))
+            else:
+                print("To: %s" % msg.get("To"))
+                print("Subject: %s" % msg.get("Subject"))
+                print("Date: %s" % msg.get("Date"))
+                print("---")
+                print(item["body"] if item["body"] is not None else "(no text body; attachments only)")
+            return 0
+        uids = uid_search(mail)
+        cap = limit or 30
+        items = []
+        for uid in uids[:cap]:
+            h = fetch_sent_header(mail, uid)
+            if h is not None:
+                items.append(h)
+    except Exception as e:
+        return fail("%s: %s" % (type(e).__name__, e), as_json)
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    if as_json:
+        print(json.dumps({"ok": True, "folder": fol, "count": len(uids), "items": items},
+                         ensure_ascii=False))
+    else:
+        for it in items:
+            print("[%s] %s" % (it["uid"], it["date"]))
+            print("  To: %s" % it["to"])
+            print("  Subject: %s" % it["subject"])
+        print("--- %s: listed %d of %d (most recent first)" % (fol, len(items), len(uids)))
+    return 0
+
+
 def parse_argv(argv):
     """手写小解析：位置参数收进 list，--config/--limit/--body-file 吃一个值，
     --json/--all/--no-sig 是布尔。argparse 的 known/unknown 拆分会把这些全拆散，
@@ -473,7 +694,7 @@ def parse_argv(argv):
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--config", "--limit", "--body-file"):
+        if a in ("--config", "--limit", "--body-file", "--folder"):
             if i + 1 >= len(argv):
                 raise SystemExit("option %s needs a value" % a)
             flags[a] = argv[i + 1]
@@ -521,10 +742,15 @@ def main():
             body = sys.stdin.read()
         return cmd_send(cfg, cfg_path, rest[0], rest[1], body,
                         append_sig=bool(flags.get("--no-sig")) is False, as_json=as_json)
+    if cmd == "sent":
+        limit = int(flags["--limit"]) if "--limit" in flags else None
+        return cmd_sent(cfg, cfg_path, rest[0] if rest else None, as_json=as_json,
+                        limit=limit, folder=flags.get("--folder"))
     if cmd == "selftest":
         return cmd_selftest(cfg, cfg_path, as_json=as_json)
-    print(__doc__)
-    return 0
+    # 未知命令别 exit 0：命令打错了却回「成功」，和这轮修的病根是同一种病。
+    print(__doc__, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

@@ -8,8 +8,13 @@ v2 开始自带一个浏览器面板（侧栏「📬 邮箱」按钮）：
 | 页签 | 内容 |
 | --- | --- |
 | 收件箱 | 入站投递账本（元数据），每封可点开看正文 |
-| 已发送 | 出站账本：所有发出去的信（含失败原因）全文可验收 |
+| 已发送 | **两个来源**：① 信箱已发送（直连 IMAP 的 Sent 文件夹，**权威**）② 本地账本（发送脚本的 outbox.jsonl，含失败原因） |
 | 设置 | IMAP / SMTP / 授权码 / 投递路径等全部可视化配置；保存即热重启守夜进程 |
+
+> 「已发送」为什么要有两个来源：本地账本是**发送方**写的，而发送方跑在 workspace-write
+> 沙盒里，写不了数据目录（详见「已趟平的坑」第 9 条）。信箱自己的 Sent 文件夹才不受这个
+> 限制——信真的发出去了才会出现在那，历史也在。所以面板默认看它；本地账本留着看
+> 「失败 / 被拒」的原因（那些信根本没进信箱，只有它记得）。
 
 ## 架构一句话
 
@@ -26,6 +31,9 @@ v2 开始自带一个浏览器面板（侧栏「📬 邮箱」按钮）：
 DSH 新会话（标题「📬 新邮件：<主题>」）
 
 出站信（邮件会话里跑 py/mail_agent.py send）→ 自动 append dataDir/outbox.jsonl → 面板「已发送」
+  · 若发送方在沙盒里（写不了 dataDir）→ 补录到 <工作区>/.dsh/mail-watch/outbox-spool.jsonl
+    → 插件宿主并回 dataDir/outbox.jsonl（drainSpool）
+  · 面板「已发送」默认看的是 IMAP 的 Sent 文件夹（权威源），不是这本账
 入站投递 → dataDir/inbox.jsonl → 面板「收件箱」
 ```
 
@@ -69,7 +77,11 @@ DSH 新会话（标题「📬 新邮件：<主题>」）
 | `config.json` | 全部配置（含授权码；写时尽量 0600） |
 | `watch-state.json` | UID 水位（`uidValidity` + `lastUid`）——唯一去重依据 |
 | `inbox.jsonl` | 入站投递账本（每行 JSON：deliveryId / items 元数据 / trigger） |
-| `outbox.jsonl` | 出站账本（每行 JSON：to / subject / body / files / ok / error） |
+| `outbox.jsonl` | 出站账本（每行 JSON：to / subject / body / files / ok / error / outbox） |
+
+沙盒内的发送方写不了上面这本，只能补录到**工作区**里的
+`<delivery.workspacePath>/.dsh/mail-watch/outbox-spool.jsonl`；插件宿主每次读账本
+（以及每 30 秒的状态轮询）都会把它并回 `outbox.jsonl` 并清空。这个文件平时应该是空的。
 
 删 `watch-state.json` = 水位重设到当前最大 UID，**不会**倒历史邮件；
 删 `config.json` = 回到未配置状态（面板里重新填）。
@@ -80,7 +92,9 @@ DSH 新会话（标题「📬 新邮件：<主题>」）
 | --- | --- |
 | `GET /api/mail-watch/status` | 守夜进程状态（pid / 水位 / 最近错误 / needsSetup）——只读，不含凭据 |
 | `GET /api/mail-watch/inbox?limit=` | 入站账本（倒序） |
-| `GET /api/mail-watch/outbox?limit=` | 出站账本（倒序，含全文） |
+| `GET /api/mail-watch/outbox?limit=` | 出站账本（倒序，含全文；读之前先把工作区 spool 并回来） |
+| `GET /api/mail-watch/sent?limit=` | **已发送（权威）**：直连信箱 Sent 文件夹的最近 N 封头部 |
+| `GET /api/mail-watch/sent?uid=` | 「已发送」里某一封的全文 |
 | `GET /api/mail-watch/read?uid=` | 按需拉一封的全文（转调 `py/mail_agent.py read --json`） |
 | `GET /api/mail-watch/check?limit=` | 实时列信箱最近几封头部（转调 `check --json`） |
 | `GET /api/mail-watch/selftest` | 发真自测信并等回收（闭环验证 IMAP+SMTP，约 10 秒） |
@@ -95,9 +109,14 @@ python py\mail_agent.py check --json --limit 15     # 列最近信件
 python py\mail_agent.py read <UID或序号> --json     # 读正文（UID/序号自动判别）
 python py\mail_agent.py send <to> <subject> --body-file F [--no-sig]
 python py\mail_agent.py selftest                    # 闭环自测信
+python py\mail_agent.py sent --json --limit 15       # 列「已发送」（直连信箱，权威源）
+python py\mail_agent.py sent <UID> --json            # 读「已发送」里某一封的正文
 python py\send_files.py <to> <subject> --body-file F --files a.pdf b.txt
 python py\mail_watch.py --once                      # 手动查一次（插件在跑时别用）
 ```
+
+`sent` 不靠猜文件夹名：先认 `LIST` 回来的 `\Sent` 特殊属性，再退回几个 ASCII 兜底名
+（网易系的「已发送」= `&XfJT0ZAB-`，modified UTF-7）。要指定就 `--folder`。
 
 配置读取顺序：`--config <路径>` → 环境变量 `MAILWATCH_HOME` → `~/.dsh-mail-watch/config.json`。格式：
 
@@ -135,6 +154,9 @@ python py\mail_watch.py --once                      # 手动查一次（插件�
    两条经验写给下一个写插件的人：
    * `RegExp.exec` 会被判成 `scripts/exec_api` 高危（误报）——纯字符串解析一律用 `String.match`。
    * 要起外部进程时用 `spawn` 而不是 `execFile`：后者直接触发同一个 HIGH，会让所有下游安装被 BLOCK。
+   * **`tests/` 也算在扫描范围内**：测试里别写 `fs.rmSync(..., {recursive:true})`（= `scripts/rm_recursive`
+     HIGH），按显式路径 `unlinkSync` / `rmdirSync` 删。0.2.2 加测试时就踩过一次：自扫从 WARN 掉到 BLOCK，
+     等于把这个插件对所有下游机器变成不可安装。改完跑一次 `gate_scan`，确认仍是 **WARN / High: 0**。
 6. **`ctx.effect` 是唯一清理入口**：子进程、路由、规则全挂上面，否则热重载留野进程。
 7. **热重载边界**：`patchReload: live` 下改 patch 里生效的 config 值会热重载；但改本插件的
    `lib/index.js` 不重替换（ESM 按 URL 缓存），要真重启 DSH。浏览器半边 `lib/client.js` 刷新页面即可。
@@ -142,6 +164,25 @@ python py\mail_watch.py --once                      # 手动查一次（插件�
    标记，**不是「本机账号发出」**——另一台机器跑着同款插件给这台发对聊信时也带这个头。只认头
    会把对方的来信当成回环自测信静默吞掉。判定必须双条件：带 loop 头 **且** 发件人 == `imap.user`。
    两台同款插件互发邮件对聊是支持的玩法，别把自家标记当过滤器判据。
+9. **账本别让沙盒里的发送方单独负责（0.2.2 修的真实事故）**：邮件会话是 `workspace-write`
+   权限起来的（刻意的：来信正文是不可信外部数据），可写范围**只有会话工作区**。而
+   `~/.dsh-mail-watch/outbox.jsonl` 在工作区外面——脚本 append 它必得
+   `[Errno 13] Permission denied`。旧版重试 3 次后**只往 stderr 写一行就返回**，
+   于是：信真的发出去了（SMTP 走网络，不受文件沙盒影响）、`stderr` 里躺着 3 行失败、
+   而那几行**根本不在会话 agent 看得到的地方**（agent 只看 stdout），面板「已发送」
+   永远是空的。三条一起改，缺一条都不算修好：
+   * 写不进去 → 补录到 `<工作区>/.dsh/mail-watch/outbox-spool.jsonl`，宿主 `drainSpool()`
+     并回（宿主不受沙盒限制）；
+   * 结果**如实上报**（`outbox: ledger|spool|null`，非 stdout 的提示也算），
+     会话里那句「发出去了 ≠ 落账了」写进了投递 prompt；
+   * 「已发送」的**权威源**改成 IMAP 的 Sent 文件夹，本地账本降为补充——
+     沙盒、权限、换机器都拦不住服务商那边的账。
+   顺带修的两个同类病根：`send_files.py` 从来不把 `main()` 的返回码交给 `sys.exit`，
+   发信失败也 exit 0；`mail_agent.py` 认不出的子命令打印帮助后 exit 0。
+   **判据**：`.dsh-mail-watch/outbox.jsonl` 里没有某封信 ≠ 那封信没发出去。
+   想知道发出去过什么，看 `sent`（信箱），不看账本。
+10. **改完必须能读回验证**：`python tests/check-ledger.py`（py 侧落点 + 不许静默成功）
+    与 `node tests/check-spool.mjs`（宿主侧并回，含重复并回与半行）。两条都跑，别只看日志。
 
 ## 从早期版本升级
 
@@ -157,7 +198,9 @@ python py\mail_watch.py --once                      # 手动查一次（插件�
 * **面板不是纯邮件查看器**：收件箱的**列表**来自投递账本（`inbox.jsonl`），也就是「投递过的信」；
   想按 uid 读任意一封的全文仍然可以（走 `read` 路由直连 IMAP）。如果只想要一个「看邮件」的界面、
   不要自动开会话，目前**没有**那个开关——那需要额外加一个「只记账不投递」的模式。
-* 只轮询 INBOX，不分文件夹。
+* 守夜进程只轮询 INBOX；「已发送」是面板点开时**按需**去读 Sent 文件夹（不轮询、不投递、readonly）。
 * 网络层面只实现了 IMAPS(993)；STARTTLS 代码存在但没作为主路径验证过。
-* 出站账本只覆盖 `py/mail_agent.py` / `py/send_files.py` 这条命令行路径（面板里的已发送 = 这两口的账）。
+* 本地账本（outbox.jsonl / spool）只覆盖 `py/mail_agent.py` / `py/send_files.py` 这条命令行路径，
+  而且**0.2.2 之前那些被沙盒拦掉的历史发送不在里面**（它们只存在于信箱的 Sent 文件夹，
+  也就是面板「信箱已发送」那一栏）。
 * 「这封信处理完了吗」没有状态机：面板只显示投递发生过；处理结论看开出来的那些会话。
